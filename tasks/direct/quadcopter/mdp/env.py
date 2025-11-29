@@ -93,68 +93,58 @@ class QuadcopterEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        # 1. Guardar estado anterior (para penalizaciones)
+        # 1. Guardar estados
         self._last_root_lin_vel_b = self._robot.data.root_lin_vel_b.clone()
         self._last_actions = self._actions.clone()
-        
-        # 2. Clampear acciones [-1, 1]
         self._actions = actions.clone().clamp(-1.0, 1.0)
         
-        # --- MIXER FÍSICO (CRAZYFLIE X-CONFIG) ---
+        # --- CÁLCULO DINÁMICO (HEAVY LIFT) ---
         
-        # Mapeos
-        # Thrust: [0, 1]. Si la red saca -1 -> 0 thrust. Si saca 1 -> Max thrust.
-        cmd_thrust = (self._actions[:, 0] + 1.0) / 2.0  
+        # 1. Feedforward de Hover
+        # Usamos la masa real (10.12 kg aprox)
+        # hover_force será aprox 25 N por motor.
+        hover_force = (self._robot_mass * 9.81) / 4.0
         
-        # Reducimos la autoridad de giro al principio. 
-        # Si esto es muy alto, el dron entra en barrena antes de aprender a flotar.
-        gain_att = 0.03  # Reducido de 0.05 a 0.03 para más estabilidad inicial
-        cmd_roll   = self._actions[:, 1] * gain_att
-        cmd_pitch  = self._actions[:, 2] * gain_att
-        cmd_yaw    = self._actions[:, 3] * gain_att
-
-        # Feedforward de Gravedad:
-        # El Crazyflie pesa ~30g => ~0.294 N.
-        # Por motor: 0.294 / 4 = 0.0735 N.
-        # Le damos un poco menos (0.07) para que la red tenga que poner un poquito de su parte.
-        hover_force = 0.07
-
-        # Fuerza máxima por motor (aprox 15g = 0.15N)
-        max_thrust = 0.15
-
-        # Mezcla (Mixer)
-        # F = Thrust_base + Gravity_help +/- Roll +/- Pitch +/- Yaw
-        # Nota: Ajusta signos si ves que correge al revés
-        force_m1 = (cmd_thrust * max_thrust) - cmd_roll - cmd_pitch + cmd_yaw + hover_force
-        force_m2 = (cmd_thrust * max_thrust) - cmd_roll + cmd_pitch - cmd_yaw + hover_force
-        force_m3 = (cmd_thrust * max_thrust) + cmd_roll + cmd_pitch + cmd_yaw + hover_force
-        force_m4 = (cmd_thrust * max_thrust) + cmd_roll - cmd_pitch - cmd_yaw + hover_force
-
-        # Clamping físico (0 a Max)
-        self._motor_forces[:, 0] = torch.clamp(force_m1, 0.0, max_thrust)
-        self._motor_forces[:, 1] = torch.clamp(force_m2, 0.0, max_thrust)
-        self._motor_forces[:, 2] = torch.clamp(force_m3, 0.0, max_thrust)
-        self._motor_forces[:, 3] = torch.clamp(force_m4, 0.0, max_thrust)
-
-        # --- APLICACIÓN AL CUERPO ---
+        # 2. Ganancias del Mixer (CRÍTICO)
+        # Con inercia 0.15 (muy alta), necesitamos mucha autoridad.
+        # Subimos de 0.15 a 0.40. Esto permite usar casi el 40% del empuje 
+        # disponible solo para girar si es necesario.
+        gain_roll_pitch = 0.40  
+        gain_yaw        = 0.45  # El Yaw en drones grandes es lento, dale caña.
         
-        # 1. Empuje Total (Eje Z local)
+        cmd_thrust = (self._actions[:, 0] + 1.0) / 2.0
+        cmd_roll   = self._actions[:, 1] * gain_roll_pitch
+        cmd_pitch  = self._actions[:, 2] * gain_roll_pitch
+        cmd_yaw    = self._actions[:, 3] * gain_yaw
+
+        # 3. Mixer X-Config
+        t_max = self.cfg.max_thrust_per_motor # 55.0 N
+        
+        f1 = (cmd_thrust * t_max) - cmd_roll - cmd_pitch + cmd_yaw + hover_force
+        f2 = (cmd_thrust * t_max) - cmd_roll + cmd_pitch - cmd_yaw + hover_force
+        f3 = (cmd_thrust * t_max) + cmd_roll + cmd_pitch + cmd_yaw + hover_force
+        f4 = (cmd_thrust * t_max) + cmd_roll - cmd_pitch - cmd_yaw + hover_force
+
+        # Clamping
+        self._motor_forces[:, 0] = torch.clamp(f1, 0.0, t_max)
+        self._motor_forces[:, 1] = torch.clamp(f2, 0.0, t_max)
+        self._motor_forces[:, 2] = torch.clamp(f3, 0.0, t_max)
+        self._motor_forces[:, 3] = torch.clamp(f4, 0.0, t_max)
+
+        # 4. Aplicar al cuerpo
         self._thrust[:, 0, 2] = torch.sum(self._motor_forces, dim=1)
         
-        # 2. Momentos (Torques) usando brazos de palanca reales
-        # Roll (Eje X) -> Par generado por distancia Y
+        # Momentos (Brazo de palanca 0.35m hace su trabajo aquí)
         m_roll = (self.motor_positions[0, 1] * self._motor_forces[:, 0]) + \
                  (self.motor_positions[1, 1] * self._motor_forces[:, 1]) + \
                  (self.motor_positions[2, 1] * self._motor_forces[:, 2]) + \
                  (self.motor_positions[3, 1] * self._motor_forces[:, 3])
 
-        # Pitch (Eje Y) -> Par generado por distancia -X
         m_pitch = (-self.motor_positions[0, 0] * self._motor_forces[:, 0]) + \
                   (-self.motor_positions[1, 0] * self._motor_forces[:, 1]) + \
                   (-self.motor_positions[2, 0] * self._motor_forces[:, 2]) + \
                   (-self.motor_positions[3, 0] * self._motor_forces[:, 3])
 
-        # Yaw (Eje Z) -> Par aerodinámico
         m_yaw = self.cfg.torque_coefficient * (
             (self._motor_forces[:, 0] * self.motor_dirs[0]) + \
             (self._motor_forces[:, 1] * self.motor_dirs[1]) + \
@@ -165,7 +155,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._moment[:, 0, 0] = m_roll
         self._moment[:, 0, 1] = m_pitch
         self._moment[:, 0, 2] = m_yaw
-        
+
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 

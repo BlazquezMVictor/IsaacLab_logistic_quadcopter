@@ -8,7 +8,7 @@ class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # CAMBIO 1: Horizonte temporal más largo.
     # 24 pasos es muy poco (~0.2s). El dron necesita ver las consecuencias de su inercia.
     # Subimos a 48 o 60 pasos (~0.5 - 0.6 segundos de trayectoria por update).
-    num_steps_per_env = 48
+    num_steps_per_env = 64
     
     # Mantenemos las iteraciones, pero al aumentar los steps por env, 
     # cada iteración procesa el doble de datos, así que entrenará "más" en menos iteraciones.
